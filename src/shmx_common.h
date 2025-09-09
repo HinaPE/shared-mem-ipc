@@ -2,6 +2,7 @@
 #define SHMX_COMMON_H
 #include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <string_view>
