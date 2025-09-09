@@ -5,6 +5,7 @@
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <new>
 #include <string>
 #include <thread>
 #include <utility>
@@ -62,7 +63,7 @@ namespace shmx {
             if (!map_.create(cfg.name, static_cast<std::size_t>(total64))) return false;
 
             hdr_ = reinterpret_cast<GlobalHeader*>(map_.data());
-            std::memset(hdr_, 0, sizeof(GlobalHeader));
+            new (hdr_) GlobalHeader{};
 
             session_id_      = make_session_id();
             hdr_->magic      = MAGIC;
