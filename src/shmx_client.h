@@ -24,6 +24,7 @@ namespace shmx {
         const std::uint8_t* payload{};
         std::uint32_t bytes{};
         bool session_mismatch{};
+        std::uint32_t checksum_mismatch{};
     };
     struct DecodedItem {
         const void* ptr;
@@ -61,10 +62,16 @@ namespace shmx {
                 return false;
             }
             GH_ = reinterpret_cast<GlobalHeader*>(map_.data());
-            return validate_header_min();
+            if (!validate_header_min()) {
+                close();
+                return false;
+            }
+            attach_slot();
+            return true;
         }
 
         void close() noexcept {
+            detach_slot();
             map_.close();
             GH_                = nullptr;
             reader_slot_index_ = UINT32_MAX;
@@ -88,22 +95,24 @@ namespace shmx {
             const std::uint8_t* cur = map_.data() + GH->static_offset;
             const std::uint8_t* end = cur + GH->static_bytes_used;
             while (cur + sizeof(TLV) <= end) {
-                const auto* tlv    = reinterpret_cast<const TLV*>(cur);
-                const auto tlv_end = cur + sizeof(TLV) + tlv->length;
+                TLV tlv{};
+                std::memcpy(&tlv, cur, sizeof(TLV));
+                const auto tlv_end = cur + sizeof(TLV) + tlv.length;
                 if (tlv_end > end) break;
-                if (tlv->type == TLV_STATIC_DIR) {
-                    if (tlv->length < sizeof(StaticStreamDesc)) break;
-                    const auto* ss    = reinterpret_cast<const StaticStreamDesc*>(cur + sizeof(TLV));
+                if (tlv.type == TLV_STATIC_DIR) {
+                    if (tlv.length < sizeof(StaticStreamDesc)) break;
+                    StaticStreamDesc ss{};
+                    std::memcpy(&ss, cur + sizeof(TLV), sizeof(StaticStreamDesc));
                     const auto* pName = reinterpret_cast<const char*>(cur + sizeof(TLV) + sizeof(StaticStreamDesc));
-                    if (sizeof(StaticStreamDesc) + ss->name_len + ss->extra_len > tlv->length) break;
-                    StaticStreamInfo si{ss->stream_id, ss->element_type, ss->components, ss->layout, ss->bytes_per_elem, std::string(pName, pName + ss->name_len), {}};
-                    if (ss->extra_len) {
-                        const auto* pExtra = reinterpret_cast<const std::uint8_t*>(pName + ss->name_len);
-                        si.extra.assign(pExtra, pExtra + ss->extra_len);
+                    if (sizeof(StaticStreamDesc) + ss.name_len + ss.extra_len > tlv.length) break;
+                    StaticStreamInfo si{ss.stream_id, ss.element_type, ss.components, ss.layout, ss.bytes_per_elem, std::string(pName, pName + ss.name_len), {}};
+                    if (ss.extra_len) {
+                        const auto* pExtra = reinterpret_cast<const std::uint8_t*>(pName + ss.name_len);
+                        si.extra.assign(pExtra, pExtra + ss.extra_len);
                     }
                     out.dir.emplace_back(std::move(si));
                 }
-                cur += align_up(static_cast<std::uint32_t>(sizeof(TLV)) + tlv->length, 16);
+                cur += align_up(static_cast<std::uint32_t>(sizeof(TLV)) + tlv.length, 16);
             }
             const auto g2 = GH->static_gen.load(std::memory_order_acquire);
             return g1 == g2;
@@ -113,16 +122,21 @@ namespace shmx {
             const auto* GH = header();
             if (!GH || !basic_sanity(*GH)) return false;
             if (GH->slots == 0) return false;
-            const auto w          = GH->write_index.load(std::memory_order_acquire);
-            const auto slot       = (w != 0) ? ((w - 1u) % GH->slots) : 0u;
+            const auto w = GH->write_index.load(std::memory_order_acquire);
+            if (w == 0u) return false;
+            const auto slot       = (w - 1u) % GH->slots;
             const auto* base_slot = map_.data() + GH->slots_offset + slot * GH->slot_stride;
             const auto* FH        = reinterpret_cast<const FrameHeader*>(base_slot);
             const auto* payload   = base_slot + align_up(static_cast<std::uint32_t>(sizeof(FrameHeader)), 64);
             const auto bytes      = FH->payload_bytes;
             if (bytes == 0 || bytes > GH->frame_bytes_cap) return false;
-            out = FrameView{FH, payload, bytes, FH->session_id_copy != GH->session_id};
+            const bool mismatch = FH->session_id_copy != GH->session_id;
+            if (mismatch) return false;
+            const auto calc        = checksum32(payload, bytes);
+            const std::uint32_t cm = FH->checksum;
+            out                    = FrameView{FH, payload, bytes, false, static_cast<std::uint32_t>(calc != cm)};
             heartbeat_seen(FH->frame_id.load(std::memory_order_acquire));
-            return true;
+            return out.checksum_mismatch == 0u;
         }
 
         [[nodiscard]] static bool decode(const FrameView& fv, DecodedFrame& df) {
@@ -130,18 +144,20 @@ namespace shmx {
             const auto* cur = fv.payload;
             const auto* end = fv.payload + fv.bytes;
             while (cur + sizeof(TLV) <= end) {
-                const auto* tlv    = reinterpret_cast<const TLV*>(cur);
-                const auto tlv_end = cur + sizeof(TLV) + tlv->length;
+                TLV tlv{};
+                std::memcpy(&tlv, cur, sizeof(TLV));
+                const auto tlv_end = cur + sizeof(TLV) + tlv.length;
                 if (tlv_end > end) break;
-                if (tlv->type == TLV_FRAME_STREAM) {
-                    if (tlv->length < sizeof(FrameStreamTLV)) break;
-                    const auto* fs         = reinterpret_cast<const FrameStreamTLV*>(cur + sizeof(TLV));
-                    const auto* body       = cur + sizeof(TLV) + sizeof(FrameStreamTLV);
-                    const auto have = static_cast<std::size_t>(end - body);
-                    if (have < fs->bytes_payload) break;
-                    df.streams.emplace_back(fs->stream_id, DecodedItem{body, fs->bytes_payload, fs->elem_count});
+                if (tlv.type == TLV_FRAME_STREAM) {
+                    if (tlv.length < sizeof(FrameStreamTLV)) break;
+                    FrameStreamTLV fs{};
+                    std::memcpy(&fs, cur + sizeof(TLV), sizeof(FrameStreamTLV));
+                    const auto* body = cur + sizeof(TLV) + sizeof(FrameStreamTLV);
+                    const auto have  = static_cast<std::size_t>(end - body);
+                    if (have < fs.bytes_payload) break;
+                    df.streams.emplace_back(fs.stream_id, DecodedItem{body, fs.bytes_payload, fs.elem_count});
                 }
-                cur += align_up(static_cast<std::uint32_t>(sizeof(TLV)) + tlv->length, 16);
+                cur += align_up(static_cast<std::uint32_t>(sizeof(TLV)) + tlv.length, 16);
             }
             return true;
         }
@@ -150,53 +166,44 @@ namespace shmx {
             auto* GH = header();
             if (!GH || GH->control_per_reader == 0) return false;
             if (reader_slot_index_ == UINT32_MAX) {
-                for (std::uint32_t i = 0; i < GH->reader_slots; ++i) {
-                    auto* RS             = reinterpret_cast<ReaderSlot*>(map_.data() + GH->readers_offset + i * GH->reader_slot_stride);
-                    std::uint32_t expect = 0;
-                    if (RS->in_use.compare_exchange_strong(expect, 1u, std::memory_order_acq_rel)) {
-                        reader_slot_index_ = i;
-                        reader_id_         = make_reader_id();
-                        RS->reader_id.store(reader_id_, std::memory_order_release);
-                        GH->readers_connected.fetch_add(1u, std::memory_order_acq_rel);
-                        break;
-                    }
-                }
-                if (reader_slot_index_ == UINT32_MAX) return false;
+                if (!attach_slot()) return false;
             }
             auto* RS = reinterpret_cast<ReaderSlot*>(map_.data() + GH->readers_offset + reader_slot_index_ * GH->reader_slot_stride);
             RS->heartbeat.store(now_ticks(), std::memory_order_release);
             auto* const CH  = map_.data() + GH->control_offset + reader_slot_index_ * GH->control_stride;
             const auto cap  = GH->control_per_reader;
-            auto* const r   = reinterpret_cast<std::atomic<std::uint32_t>*>(CH);
-            auto* const w   = r + 1;
+            auto* const r64 = reinterpret_cast<std::atomic<std::uint64_t>*>(CH);
+            auto* const w64 = r64 + 1;
             const auto need = align_up(static_cast<std::uint32_t>(sizeof(TLV)) + bytes, 16);
-            const auto rv0  = r->load(std::memory_order_acquire);
-            const auto wv0  = w->load(std::memory_order_acquire);
-            if (((wv0 + need) - rv0) > (cap - 8u)) return false;
+            const auto rv0  = r64->load(std::memory_order_acquire);
+            const auto wv0  = w64->load(std::memory_order_acquire);
+            if (((wv0 + need) - rv0) > (cap - 16u)) return false;
             auto wv           = wv0;
-            auto off          = 8u + (wv % (cap - 8u));
+            auto off          = 16u + static_cast<std::uint32_t>(wv % (cap - 16u));
             auto space_to_end = cap - off;
             if (need > space_to_end) {
-                const auto span_to_end = (cap - 8u) - (wv % (cap - 8u));
-                if (((wv + span_to_end) - rv0) > (cap - 8u)) return false;
+                const auto span_to_end = (cap - 16u) - static_cast<std::uint32_t>(wv % (cap - 16u));
+                if (((wv + span_to_end) - rv0) > (cap - 16u)) return false;
                 if (space_to_end >= sizeof(TLV)) {
-                    auto* pad   = reinterpret_cast<TLV*>(CH + off);
-                    pad->type   = 0u;
-                    pad->length = static_cast<std::uint32_t>(space_to_end - sizeof(TLV));
+                    TLV pad{};
+                    pad.type   = 0u;
+                    pad.length = static_cast<std::uint32_t>(space_to_end - sizeof(TLV));
+                    std::memcpy(CH + off, &pad, sizeof(TLV));
                     std::atomic_thread_fence(std::memory_order_release);
                 }
                 wv += span_to_end;
-                w->store(wv, std::memory_order_release);
-                off = 8u;
-                if (((wv + need) - rv0) > (cap - 8u)) return false;
+                w64->store(wv, std::memory_order_release);
+                off = 16u;
+                if (((wv + need) - rv0) > (cap - 16u)) return false;
             }
-            auto* tlv   = reinterpret_cast<TLV*>(CH + off);
-            tlv->type   = tlv_type;
-            tlv->length = bytes;
+            TLV tlv{};
+            tlv.type   = tlv_type;
+            tlv.length = bytes;
+            std::memcpy(CH + off, &tlv, sizeof(TLV));
             std::memcpy(CH + off + sizeof(TLV), data, bytes);
             std::atomic_thread_fence(std::memory_order_release);
             wv += need;
-            w->store(wv, std::memory_order_release);
+            w64->store(wv, std::memory_order_release);
             return true;
         }
 
@@ -236,6 +243,37 @@ namespace shmx {
             if (!GH_) return false;
             if (GH_->magic != MAGIC || GH_->ver_major != VER_MAJOR || GH_->ver_minor != VER_MINOR || GH_->endianness != ENDIAN_TAG) return false;
             return true;
+        }
+        bool attach_slot() {
+            auto* GH = header();
+            if (!GH) return false;
+            if (reader_slot_index_ != UINT32_MAX) return true;
+            for (std::uint32_t i = 0; i < GH->reader_slots; ++i) {
+                auto* RS             = reinterpret_cast<ReaderSlot*>(map_.data() + GH->readers_offset + i * GH->reader_slot_stride);
+                std::uint32_t expect = 0;
+                if (RS->in_use.compare_exchange_strong(expect, 1u, std::memory_order_acq_rel)) {
+                    reader_slot_index_ = i;
+                    reader_id_         = make_reader_id();
+                    RS->reader_id.store(reader_id_, std::memory_order_release);
+                    RS->heartbeat.store(now_ticks(), std::memory_order_release);
+                    GH->readers_connected.fetch_add(1u, std::memory_order_acq_rel);
+                    return true;
+                }
+            }
+            return false;
+        }
+        void detach_slot() {
+            auto* GH = header();
+            if (!GH) return;
+            if (reader_slot_index_ == UINT32_MAX) return;
+            auto* RS = reinterpret_cast<ReaderSlot*>(map_.data() + GH->readers_offset + reader_slot_index_ * GH->reader_slot_stride);
+            RS->reader_id.store(0u, std::memory_order_release);
+            RS->heartbeat.store(0u, std::memory_order_release);
+            RS->last_frame_seen.store(0u, std::memory_order_release);
+            RS->in_use.store(0u, std::memory_order_release);
+            GH->readers_connected.fetch_sub(1u, std::memory_order_acq_rel);
+            reader_slot_index_ = UINT32_MAX;
+            reader_id_         = 0;
         }
 
         Map map_;

@@ -1,7 +1,6 @@
 #ifndef SHMX_COMMON_H
 #define SHMX_COMMON_H
 #include <atomic>
-#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -65,6 +64,11 @@ namespace shmx {
         return h;
     }
 
+    inline std::uint32_t checksum32(const void* data, std::size_t n) noexcept {
+        const std::uint64_t h = fnv1a64(data, n);
+        return static_cast<std::uint32_t>((h >> 32) ^ (h & 0xFFFFFFFFu));
+    }
+
 #pragma pack(push, 1)
     struct TLV {
         std::uint32_t type;
@@ -95,13 +99,15 @@ namespace shmx {
         std::atomic<std::uint64_t> frame_seq;
         std::atomic<std::uint32_t> write_index;
         std::atomic<std::uint32_t> readers_connected;
+        std::atomic<std::uint32_t> reserve_index;
     };
     struct alignas(64) FrameHeader {
         std::uint64_t session_id_copy;
         std::atomic<std::uint64_t> frame_id;
         double sim_time;
         std::uint32_t payload_bytes, tlv_count;
-        std::uint64_t reserved[3];
+        std::uint32_t checksum;
+        std::uint64_t reserved[2];
     };
     struct alignas(64) ReaderSlot {
         std::atomic<std::uint64_t> reader_id, heartbeat, last_frame_seen;
@@ -127,11 +133,21 @@ namespace shmx {
             const std::wstring w = widen(name);
             hMap_                = ::CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, static_cast<::DWORD>((static_cast<unsigned long long>(bytes)) >> 32u), static_cast<::DWORD>((static_cast<unsigned long long>(bytes)) & 0xFFFFFFFFull), w.c_str());
             if (!hMap_) return false;
+            const DWORD gle = ::GetLastError();
             base_ = static_cast<std::uint8_t*>(::MapViewOfFile(hMap_, FILE_MAP_ALL_ACCESS, 0, 0, bytes));
             if (!base_) {
                 ::CloseHandle(hMap_);
                 hMap_ = nullptr;
                 return false;
+            }
+            if (gle == ERROR_ALREADY_EXISTS) {
+                if (!base_) {
+                    ::UnmapViewOfFile(base_);
+                    ::CloseHandle(hMap_);
+                    base_ = nullptr;
+                    hMap_ = nullptr;
+                    return false;
+                }
             }
 #else
             const std::string nm = normalize(name);

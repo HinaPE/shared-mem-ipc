@@ -1,6 +1,7 @@
 #ifndef SHMX_SERVER_H
 #define SHMX_SERVER_H
 #include "shmx_common.h"
+#include <chrono>
 #include <cstring>
 #include <functional>
 #include <limits>
@@ -28,8 +29,7 @@ namespace shmx {
         struct ControlMsg {
             std::uint64_t reader_id;
             std::uint32_t type;
-            const std::uint8_t* data;
-            std::uint32_t bytes;
+            std::vector<std::uint8_t> data;
         };
 
         Server() = default;
@@ -48,7 +48,7 @@ namespace shmx {
 
             const auto slot_stride    = align_up(static_cast<std::uint32_t>(sizeof(FrameHeader)), 64) + align_up(cfg.frame_bytes_cap, 64);
             const auto readers_stride = align_up(static_cast<std::uint32_t>(sizeof(ReaderSlot)), 64);
-            const auto control_stride = align_up(cfg.control_per_reader, 64);
+            const auto control_stride = align_up(cfg.control_per_reader ? (cfg.control_per_reader) : 0u, 64);
 
             const auto static_off  = align_up(static_cast<std::uint32_t>(sizeof(GlobalHeader)), 64);
             const auto static_cap  = align_up(cfg.static_bytes_cap ? cfg.static_bytes_cap : static_dir_bytes, 64);
@@ -81,11 +81,12 @@ namespace shmx {
             hdr_->reader_slot_stride = readers_stride;
             hdr_->readers_offset     = readers_off;
             hdr_->control_offset     = control_off;
-            hdr_->control_per_reader = control_stride;
+            hdr_->control_per_reader = cfg.control_per_reader;
             hdr_->control_stride     = control_stride;
             hdr_->frame_seq.store(0u, std::memory_order_relaxed);
             hdr_->write_index.store(0u, std::memory_order_relaxed);
             hdr_->readers_connected.store(0u, std::memory_order_relaxed);
+            hdr_->reserve_index.store(0u, std::memory_order_relaxed);
 
             if (!static_dir_.empty()) {
                 if (static_dir_.size() > static_cap) return false;
@@ -109,6 +110,7 @@ namespace shmx {
                 FH->sim_time      = 0.0;
                 FH->payload_bytes = 0u;
                 FH->tlv_count     = 0u;
+                FH->checksum      = 0u;
             }
 
             slots_off_   = slots_off;
@@ -144,15 +146,16 @@ namespace shmx {
             FrameHeader* fh;
             std::uint8_t* payload;
             std::uint32_t capacity, slot, tlv_count, used;
+            std::uint32_t seq;
         };
 
         [[nodiscard]] FrameMap begin_frame() const {
-            const auto w    = hdr_->write_index.load(std::memory_order_relaxed);
-            const auto slot = hdr_->slots ? (w % hdr_->slots) : 0u;
+            const auto seq1 = hdr_->reserve_index.fetch_add(1u, std::memory_order_acq_rel) + 1u;
+            const auto slot = hdr_->slots ? ((seq1 - 1u) % hdr_->slots) : 0u;
             auto* base_slot = map_.data() + slots_off_ + slot * hdr_->slot_stride;
             auto* fh        = reinterpret_cast<FrameHeader*>(base_slot);
             auto* payload   = base_slot + align_up(static_cast<std::uint32_t>(sizeof(FrameHeader)), 64);
-            return FrameMap{fh, payload, hdr_->frame_bytes_cap, slot, 0u, 0u};
+            return FrameMap{fh, payload, hdr_->frame_bytes_cap, slot, 0u, 0u, static_cast<std::uint32_t>(seq1)};
         }
 
         static bool append_stream(FrameMap& fm, std::uint32_t stream_id, const void* data, std::uint32_t elem_count, std::uint32_t elem_bytes_total) {
@@ -161,15 +164,17 @@ namespace shmx {
             constexpr std::uint32_t body_head = sizeof(FrameStreamTLV);
             const auto need                   = align_up(tlv_head + body_head + elem_bytes_total, 16);
             if (fm.used + need > fm.capacity) return false;
-            auto* p           = fm.payload + fm.used;
-            auto* tlv         = reinterpret_cast<TLV*>(p);
-            tlv->type         = TLV_FRAME_STREAM;
-            tlv->length       = body_head + elem_bytes_total;
-            auto* fs          = reinterpret_cast<FrameStreamTLV*>(p + tlv_head);
-            fs->stream_id     = stream_id;
-            fs->elem_count    = elem_count;
-            fs->bytes_payload = elem_bytes_total;
-            fs->reserved      = 0u;
+            auto* p = fm.payload + fm.used;
+            TLV tlv{};
+            tlv.type   = TLV_FRAME_STREAM;
+            tlv.length = body_head + elem_bytes_total;
+            std::memcpy(p, &tlv, sizeof(TLV));
+            FrameStreamTLV fs{};
+            fs.stream_id     = stream_id;
+            fs.elem_count    = elem_count;
+            fs.bytes_payload = elem_bytes_total;
+            fs.reserved      = 0u;
+            std::memcpy(p + tlv_head, &fs, sizeof(FrameStreamTLV));
             std::memcpy(p + tlv_head + body_head, data, elem_bytes_total);
             fm.used += need;
             fm.tlv_count += 1u;
@@ -184,10 +189,10 @@ namespace shmx {
             fm.fh->sim_time        = sim_time;
             fm.fh->payload_bytes   = fm.used;
             fm.fh->tlv_count       = fm.tlv_count;
+            fm.fh->checksum        = checksum32(fm.payload, fm.used);
             std::atomic_thread_fence(std::memory_order_release);
             fm.fh->frame_id.store(fid, std::memory_order_release);
-            const auto w = hdr_->write_index.load(std::memory_order_relaxed);
-            hdr_->write_index.store(w + 1u, std::memory_order_release);
+            hdr_->write_index.store(fm.seq, std::memory_order_release);
             return true;
         }
 
@@ -213,36 +218,44 @@ namespace shmx {
 
             bool ok_all = true;
             for (std::uint32_t i = 0; i < hdr_->reader_slots; ++i) {
-                auto* const CH = map_.data() + hdr_->control_offset + i * hdr_->control_stride;
-                const auto cap = hdr_->control_per_reader;
-                auto* const r  = reinterpret_cast<std::atomic<std::uint32_t>*>(CH);
-                auto* const w  = r + 1;
+                auto* const CH  = map_.data() + hdr_->control_offset + i * hdr_->control_stride;
+                const auto cap  = hdr_->control_per_reader;
+                auto* const r64 = reinterpret_cast<std::atomic<std::uint64_t>*>(CH);
+                auto* const w64 = r64 + 1;
 
-                const auto rv = r->load(std::memory_order_acquire);
-                const auto wv = w->load(std::memory_order_acquire);
+                const auto rv = r64->load(std::memory_order_acquire);
+                const auto wv = w64->load(std::memory_order_acquire);
                 auto rd       = rv;
 
                 while (rd != wv && out.size() < max_msgs) {
-                    auto off = 8u + (rd % (cap - 8u));
+                    auto off = 16u + static_cast<std::uint32_t>(rd % (cap - 16u));
                     if (off + sizeof(TLV) > cap) {
-                        rd += static_cast<std::uint32_t>(cap - off);
-                        off = 8u;
+                        rd += static_cast<std::uint64_t>(cap - off);
+                        off = 16u;
                     }
-                    const auto* tlv = reinterpret_cast<const TLV*>(CH + off);
-                    const auto body = align_up(static_cast<std::uint32_t>(sizeof(TLV)) + tlv->length, 16);
+                    TLV tlv{};
+                    std::memcpy(&tlv, CH + off, sizeof(TLV));
+                    const auto body = align_up(static_cast<std::uint32_t>(sizeof(TLV)) + tlv.length, 16);
                     if (off + body > cap) {
-                        if (tlv->type == 0u) {
-                            rd += static_cast<std::uint32_t>(cap - off);
+                        if (tlv.type == 0u) {
+                            rd += static_cast<std::uint64_t>(cap - off);
                             continue;
                         }
                         ok_all = false;
                         rd     = wv;
                         break;
                     }
-                    if (tlv->type != 0u) out.push_back(ControlMsg{reader_id_of(i), tlv->type, CH + off + sizeof(TLV), tlv->length});
+                    if (tlv.type != 0u) {
+                        ControlMsg m{};
+                        m.reader_id = reader_id_of(i);
+                        m.type      = tlv.type;
+                        m.data.resize(tlv.length);
+                        std::memcpy(m.data.data(), CH + off + sizeof(TLV), tlv.length);
+                        out.push_back(std::move(m));
+                    }
                     rd += body;
                 }
-                if (rd != rv) r->store(rd, std::memory_order_release);
+                if (rd != rv) r64->store(rd, std::memory_order_release);
             }
             return ok_all;
         }
@@ -258,6 +271,26 @@ namespace shmx {
         }
         [[nodiscard]] std::uint32_t readers_connected() const noexcept {
             return hdr_->readers_connected.load(std::memory_order_acquire);
+        }
+
+        [[nodiscard]] bool reap_stale_readers(std::uint64_t now_ticks, std::uint64_t timeout_ticks) const {
+            if (!hdr_) return false;
+            bool any = false;
+            for (std::uint32_t i = 0; i < hdr_->reader_slots; ++i) {
+                auto* RS = reinterpret_cast<ReaderSlot*>(map_.data() + readers_off_ + i * hdr_->reader_slot_stride);
+                if (RS->in_use.load(std::memory_order_acquire) == 0u) continue;
+                const auto hb = RS->heartbeat.load(std::memory_order_acquire);
+                if (hb == 0) continue;
+                if (now_ticks > hb && now_ticks - hb > timeout_ticks) {
+                    RS->reader_id.store(0u, std::memory_order_release);
+                    RS->heartbeat.store(0u, std::memory_order_release);
+                    RS->last_frame_seen.store(0u, std::memory_order_release);
+                    RS->in_use.store(0u, std::memory_order_release);
+                    hdr_->readers_connected.fetch_sub(1u, std::memory_order_acq_rel);
+                    any = true;
+                }
+            }
+            return any;
         }
 
     private:
@@ -276,19 +309,21 @@ namespace shmx {
                 const auto extra_len = static_cast<std::uint32_t>(extra.size());
                 const auto body_len  = static_cast<std::uint32_t>(sizeof(StaticStreamDesc)) + name_len + extra_len;
                 tmp.resize(align_up(static_cast<std::uint32_t>(sizeof(TLV)) + body_len, 16));
-                auto* p            = tmp.data();
-                auto* tlv          = reinterpret_cast<TLV*>(p);
-                tlv->type          = TLV_STATIC_DIR;
-                tlv->length        = body_len;
-                auto* ss           = reinterpret_cast<StaticStreamDesc*>(p + sizeof(TLV));
-                ss->stream_id      = stream_id;
-                ss->element_type   = element_type;
-                ss->components     = components;
-                ss->layout         = layout;
-                ss->bytes_per_elem = bytes_per_elem;
-                ss->reserved       = 0u;
-                ss->name_len       = name_len;
-                ss->extra_len      = extra_len;
+                auto* p = tmp.data();
+                TLV tlv{};
+                tlv.type   = TLV_STATIC_DIR;
+                tlv.length = body_len;
+                std::memcpy(p, &tlv, sizeof(TLV));
+                StaticStreamDesc ss{};
+                ss.stream_id      = stream_id;
+                ss.element_type   = element_type;
+                ss.components     = components;
+                ss.layout         = layout;
+                ss.bytes_per_elem = bytes_per_elem;
+                ss.reserved       = 0u;
+                ss.name_len       = name_len;
+                ss.extra_len      = extra_len;
+                std::memcpy(p + sizeof(TLV), &ss, sizeof(StaticStreamDesc));
                 std::memcpy(p + sizeof(TLV) + sizeof(StaticStreamDesc), name_utf8.data(), name_len);
                 if (extra_len) std::memcpy(p + sizeof(TLV) + sizeof(StaticStreamDesc) + name_len, extra.data(), extra_len);
                 out.insert(out.end(), tmp.begin(), tmp.end());
