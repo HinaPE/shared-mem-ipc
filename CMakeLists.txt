@@ -5,7 +5,7 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-add_library(shmx INTERFACE src/shmx_common.h src/shmx_server.h src/shmx_client.h)
+add_library(shmx INTERFACE src/shmx_common.h src/shmx_server.h src/shmx_client.h src/shmx_inspector.h)
 target_include_directories(shmx INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 enable_testing()

@@ -134,7 +134,7 @@ namespace shmx {
             hMap_                = ::CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, static_cast<::DWORD>((static_cast<unsigned long long>(bytes)) >> 32u), static_cast<::DWORD>((static_cast<unsigned long long>(bytes)) & 0xFFFFFFFFull), w.c_str());
             if (!hMap_) return false;
             const DWORD gle = ::GetLastError();
-            base_ = static_cast<std::uint8_t*>(::MapViewOfFile(hMap_, FILE_MAP_ALL_ACCESS, 0, 0, bytes));
+            base_           = static_cast<std::uint8_t*>(::MapViewOfFile(hMap_, FILE_MAP_ALL_ACCESS, 0, 0, bytes));
             if (!base_) {
                 ::CloseHandle(hMap_);
                 hMap_ = nullptr;
